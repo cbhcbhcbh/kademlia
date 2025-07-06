@@ -9,6 +9,12 @@ use crate::{
 
 use super::node::Node;
 
+#[derive(Debug)]
+pub enum KBucketAddResult {
+    Added,
+    Replaced(KBucket, KBucket),
+}
+
 #[derive(Debug, Default)]
 pub struct KBucket {
     prefix_bits: BitVec,
@@ -28,16 +34,18 @@ impl KBucket {
         self.len() >= K_REPLICATIONS
     }
 
-    pub fn add_node(&mut self, node_id: NodeId, ip_addr: IpAddr, port: u16) {
+    pub fn add_node(&mut self, node_id: NodeId, ip_addr: IpAddr, port: u16) -> KBucketAddResult {
         let node = Node::new(node_id, ip_addr, port);
         if self.is_full() {
             if self.prefix_bits.len() < K_REPLICATIONS * 8 {
-                self.split_k_buckets(node_id, ip_addr, port);
+                let (zero, one) = self.split_k_buckets(node_id, ip_addr, port);
+                return KBucketAddResult::Replaced(zero, one);
             } else {
                 todo!("ping RPC to the least recently last_seen node");
             }
         }
         self.queue.push_back(node);
+        KBucketAddResult::Added
     }
 
     pub fn split_k_buckets(&mut self, node_id: NodeId, ip_addr: IpAddr, port: u16) -> (Self, Self) {
@@ -72,14 +80,18 @@ impl KBucket {
 
         (zero_branch, one_branch)
     }
+
+    pub fn queue(&self) -> &VecDeque<Node> {
+        &self.queue
+    }
 }
 
 #[cfg(test)]
-mod test {
+pub(crate) mod test {
 
     use super::*;
 
-    fn rand_ip_addr_and_port() -> (IpAddr, u16) {
+    pub(crate) fn rand_ip_addr_and_port() -> (IpAddr, u16) {
         let mut addr = [0; 4];
         rand::fill(&mut addr);
         (IpAddr::V4(addr.into()), rand::random_range(1024..65535))
@@ -89,7 +101,7 @@ mod test {
     fn test_split_k_buckets() {
         for _ in 0..100 {
             let mut k_bucket = KBucket::default();
-            (0..20).for_each(|_| {
+            (0..K_REPLICATIONS).for_each(|_| {
                 let (addr, port) = rand_ip_addr_and_port();
                 let node = Node::from_random_node_id(addr, port);
                 k_bucket.add_node(node.node_id(), addr, port);

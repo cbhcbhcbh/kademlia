@@ -2,9 +2,9 @@ use std::{net::IpAddr, time::SystemTime};
 
 use sha1::{Digest, Sha1};
 
-use crate::{K_REPLICATIONS, core::node};
+use crate::{ID_BYTES_LENGTH, core::node};
 
-pub type NodeId = [u8; K_REPLICATIONS];
+pub type NodeId = [u8; ID_BYTES_LENGTH];
 
 #[derive(Debug, Clone, Copy, Eq)]
 pub struct Node {
@@ -31,7 +31,7 @@ impl Node {
     }
 
     pub fn from_random_node_id(ip_addr: IpAddr, port: u16) -> Self {
-        let mut node_id = [0; K_REPLICATIONS];
+        let mut node_id = [0; ID_BYTES_LENGTH];
         rand::fill(&mut node_id);
         Node::new(node_id, ip_addr, port)
     }

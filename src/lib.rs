@@ -1,4 +1,5 @@
 pub mod core;
+pub mod rpc;
 
 #[cfg(test)]
 const ID_BYTES_LENGTH: usize = 4;

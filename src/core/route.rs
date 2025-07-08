@@ -21,7 +21,19 @@ pub enum RouteTableEntry {
     },
 }
 
-pub type NodeTuple = (NodeId, IpAddr, u16, bool);
+pub type NodeTuple = (NodeId, IpAddr, u16);
+
+#[derive(Eq, Clone, Copy)]
+pub struct NodeTupleWrapper {
+    pub(crate) node: NodeTuple,
+    pub(crate) visited: bool,
+}
+
+impl PartialEq for NodeTupleWrapper {
+    fn eq(&self, other: &Self) -> bool {
+        self.node == other.node
+    }
+}
 
 impl RouteTableEntry {
     pub fn new() -> Self {
@@ -50,14 +62,17 @@ impl RouteTableEntry {
         }
     }
 
-    pub fn find_node(&self, node_id: NodeId, bits: usize, found: &mut Vec<NodeTuple>) {
+    pub fn find_node(&self, node_id: NodeId, bits: usize, found: &mut Vec<NodeTupleWrapper>) {
         match self {
             RouteTableEntry::Leaf(kbucket) => found.extend(
                 kbucket
                     .queue()
                     .iter()
-                    .map(|n| (n.node_id(), n.ip_addr(), n.port(), false))
-                    .collect::<Vec<(_, _, _, _)>>(),
+                    .map(|n| NodeTupleWrapper {
+                        node: (n.node_id(), n.ip_addr(), n.port()),
+                        visited: false,
+                    })
+                    .collect::<Vec<_>>(),
             ),
             RouteTableEntry::Branch { zero, one } => {
                 if get_node_id_bit(&node_id, bits) {
@@ -90,15 +105,21 @@ impl RouteTableRoot {
         Self(RouteTableEntry::new())
     }
 
-    pub async fn find_node(&self, node_id: NodeId) -> Vec<NodeTuple> {
+    pub fn add_node(&mut self, node: NodeTuple) {
+        self.0.add_node(0, node.0, node.1, node.2);
+    }
+
+    // find_node, 遍历本节点的路由表，找到K个距离最近的节点，并发地请求alpha个节点，获取node_id最近的节点，
+    // 递归结束的条件:所有返回的节点已经不再比目前的K个节点距离更近的时候，结束
+    pub async fn find_node(&self, src_node_id: NodeId, node_id: NodeId) -> Vec<NodeTupleWrapper> {
         let mut result = Vec::with_capacity(K_REPLICATIONS);
         self.0.find_node(node_id, 0, &mut result);
         result.sort_by(|lhs, rhs| {
-            let distance1 = node_id_distance(&lhs.0, &node_id);
-            let distance2 = node_id_distance(&rhs.0, &node_id);
+            let distance1 = node_id_distance(&lhs.node.0, &node_id);
+            let distance2 = node_id_distance(&rhs.node.0, &node_id);
             distance1.cmp(&distance2)
         });
-
+        // todo!("aysnc request at most alpha(3) remote peers to find node");
         loop {
             let to_visit = find_unvisit_nodes(&result);
             if to_visit.is_empty() {
@@ -108,18 +129,28 @@ impl RouteTableRoot {
             {
                 for i in to_visit {
                     let p = result[i];
-                    join_set.spawn(async move { find_node_remote(node_id, p).await });
+                    result[i].visited = true;
+                    join_set.spawn(async move { find_node_remote(src_node_id, node_id, p).await });
                 }
             }
             let mut res = join_set.join_all().await;
             while let Some(r) = res.pop() {
                 if let Ok(nodes) = r {
                     for node in nodes {
-                        let distance = node_id_distance(&node.0, &node_id);
-                        let index = match result
-                            .binary_search_by_key(&distance, |n| node_id_distance(&n.0, &node_id))
-                        {
-                            Ok(index) if index < result.len() - 1 => Some(index),
+                        let distance = node_id_distance(&node.node.0, &node_id);
+                        let index = match result.binary_search_by_key(&distance, |n| {
+                            node_id_distance(&n.node.0, &node_id)
+                        }) {
+                            Ok(index) if index < result.len() - 1 => {
+                                if index > 0 {
+                                    if result[index - 1] == node || result[index + 1] == node {
+                                        continue;
+                                    }
+                                } else if result[index + 1] == node {
+                                    continue;
+                                }
+                                Some(index)
+                            }
                             Err(index) if index < result.len() => Some(index),
                             _ => None,
                         };
@@ -135,21 +166,35 @@ impl RouteTableRoot {
     }
 }
 
-async fn find_node_remote(node_id: NodeId, peer: NodeTuple) -> anyhow::Result<Vec<NodeTuple>> {
-    let req = Request::FindNode(node_id);
-    let resp = req.send(peer.1, peer.2).await?;
+async fn find_node_remote(
+    src_node_id: NodeId,
+    node_id: NodeId,
+    peer: NodeTupleWrapper,
+) -> anyhow::Result<Vec<NodeTupleWrapper>> {
+    let req = Request::FindNode {
+        src_node_id,
+        node_id,
+    };
+    let resp = req.send(peer.node.1, peer.node.2).await?;
     if let Response::Nodes { rpc_id: _, bucket } = resp {
-        Ok(bucket)
+        Ok(bucket
+            .into_iter()
+            .map(|n| NodeTupleWrapper {
+                node: n,
+                visited: false,
+            })
+            .collect())
     } else {
+        // Err(anyhow::anyhow!("invalid response type for find_node"))
         anyhow::bail!("invalid response type for find_node")
     }
 }
 
-fn find_unvisit_nodes(nodes: &[NodeTuple]) -> Vec<usize> {
+pub(crate) fn find_unvisit_nodes(nodes: &[NodeTupleWrapper]) -> Vec<usize> {
     nodes
         .iter()
         .enumerate()
-        .filter(|(_, n)| !n.3)
+        .filter(|(_, n)| !n.visited)
         .take(ALPHA_PARALLEL)
         .map(|(i, _)| i)
         .collect()
@@ -160,6 +205,10 @@ impl Default for RouteTableRoot {
         Self::new()
     }
 }
+
+//
+// find_value，先找自己有没有这个key_id，如果有，直接返回value，如果没有，使用find_node找距离key_id最近的
+// K个节点，让对方返回value，如果找不到，最终是None。递归结束的条件可能是：其中一个节点直接返回了value。
 
 #[cfg(test)]
 mod test {

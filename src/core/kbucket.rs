@@ -51,7 +51,11 @@ impl KBucket {
                 return KBucketAddResult::Replaced(zero, one);
             } else {
                 todo!("ping RPC to the least recently last_seen node");
+                // if no pong response returned, remove the node from the queue
+                // self.queue.pop_front();
+                // self.queue.push_back(node);
             }
+            // return;
         }
         self.queue.push_back(node);
         KBucketAddResult::Added
